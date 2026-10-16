@@ -1,12 +1,14 @@
 --[[
-    JJS Auto Block
-    Nhận diện animation tấn công của người gần nhất rồi tự giữ phím block.
+    JJS Auto Block v2
+    Quét animation của người gần nhất:
+      - Có animation tấn công -> xoay camera về phía họ (nếu họ ở phía trước bạn)
+      - Giữ phím block đến khi animation đó kết thúc
+      - Xong thì trả camera về góc nhìn ban đầu
+      - Nếu họ ở phía sau lưng: vẫn block nhưng KHÔNG đổi góc nhìn
 
-    Cách dùng:
-      1. Bật "Chế độ học" -> để người khác tung chiêu gần bạn.
-      2. Mỗi animation lạ xuất hiện trong danh sách log; bấm vào dòng để chọn nó là "đòn cần block".
-      3. Tắt "Chế độ học", bật "Auto Block" (hoặc nhấn phím G).
-    Bấm "Copy danh sách" để lưu ID, rồi dán vào PRESET_ANIMS lần sau.
+    Mặc định phản ứng với mọi animation không lặp của người gần nhất.
+    Muốn lọc chính xác hơn: bật "Chế độ học", chọn các đòn cần block,
+    rồi bật "Chỉ đòn đã chọn".
 ]]
 
 local Players = game:GetService("Players")
@@ -19,8 +21,11 @@ local VirtualInputManager = game:GetService("VirtualInputManager")
 local LocalPlayer = Players.LocalPlayer
 
 -- ===== Cấu hình =====
-local BLOCK_KEY = Enum.KeyCode.F   -- đổi theo phím block trong game
-local TOGGLE_KEY = Enum.KeyCode.G  -- bật/tắt Auto Block nhanh
+local BLOCK_KEY = Enum.KeyCode.F    -- phím block trong game
+local TOGGLE_KEY = Enum.KeyCode.G   -- bật/tắt Auto Block nhanh
+local USE_KEYPRESS = false          -- true: dùng keypress()/keyrelease() của executor thay cho VirtualInputManager
+local MAX_BLOCK_TIME = 4            -- giây, giới hạn an toàn cho một lần giữ block
+local CAMERA_TURN_SPEED = 35        -- càng cao càng xoay nhanh
 local PRESET_ANIMS = {
     -- "rbxassetid://1234567890",
 }
@@ -35,7 +40,6 @@ local parentGui = (gethui and gethui()) or CoreGui
 local connections = {}
 local function track(c) table.insert(connections, c) return c end
 
--- Danh sách animation được giữ lại giữa các lần chạy lại script
 env.JJS_AutoBlockAnims = env.JJS_AutoBlockAnims or {}
 local attackSet = env.JJS_AutoBlockAnims
 for _, id in ipairs(PRESET_ANIMS) do
@@ -45,11 +49,13 @@ end
 local settings = {
     Enabled = false,
     Learn = false,
-    Range = 15,
-    Delay = 0,
-    Hold = 0.5,
+    OnlySelected = false,
+    TurnCamera = true,
     OnlyNearest = true,
-    Facing = true,
+    Facing = false,
+    Range = 20,
+    Delay = 0,
+    MinHold = 0.15,
 }
 
 -- ===== Theme + helper =====
@@ -64,7 +70,6 @@ local T = {
     Good = Color3.fromRGB(70, 220, 120),
     Text = Color3.fromRGB(238, 238, 245),
     Sub = Color3.fromRGB(150, 150, 172),
-    Danger = Color3.fromRGB(255, 70, 70),
 }
 
 local function create(class, props, children)
@@ -85,29 +90,115 @@ end
 
 local function corner(r) return create("UICorner", { CornerRadius = UDim.new(0, r) }) end
 
--- ===== Block =====
-local blocking = false
-local blockUntil = 0
+local function count(t)
+    local n = 0
+    for _ in pairs(t) do n += 1 end
+    return n
+end
+
+-- ===== Nhấn phím block =====
+local keyDown = false
+
+local function keyVK()
+    local n = BLOCK_KEY.Name
+    if #n == 1 then return string.byte(n) end
+    return nil
+end
 
 local function pressBlock(down)
-    pcall(function()
-        VirtualInputManager:SendKeyEvent(down, BLOCK_KEY, false, game)
-    end)
+    if down == keyDown then return end
+    keyDown = down
+    if USE_KEYPRESS and keypress and keyrelease and keyVK() then
+        pcall(down and keypress or keyrelease, keyVK())
+    else
+        pcall(function()
+            VirtualInputManager:SendKeyEvent(down, BLOCK_KEY, false, game)
+        end)
+    end
 end
 
-local function triggerBlock()
-    task.delay(settings.Delay, function()
-        blockUntil = math.max(blockUntil, os.clock() + settings.Hold)
-        if blocking then return end
-        blocking = true
-        pressBlock(true)
-        while os.clock() < blockUntil and settings.Enabled do
-            task.wait()
+-- ===== Phiên block (session) =====
+-- session = { tracks = {[AnimationTrack] = true}, startTime, savedLook, rotated, target(hrp) }
+local session = nil
+local BIND_NAME = "JJS_AutoBlockCam"
+
+local function endSession()
+    if not session then return end
+    pressBlock(false)
+    if session.rotated and session.savedLook then
+        local cam = Workspace.CurrentCamera
+        if cam then
+            local pos = cam.CFrame.Position
+            cam.CFrame = CFrame.lookAt(pos, pos + session.savedLook)
         end
-        pressBlock(false)
-        blocking = false
-    end)
+    end
+    session = nil
 end
+
+local function startOrExtend(animTrack, hrp)
+    if not settings.Enabled then return end
+    if not session then
+        local cam = Workspace.CurrentCamera
+        session = {
+            tracks = {},
+            startTime = os.clock(),
+            savedLook = cam and cam.CFrame.LookVector or Vector3.new(0, 0, -1),
+            rotated = false,
+            target = nil,
+        }
+        pressBlock(true)
+    end
+    session.tracks[animTrack] = true
+    session.target = hrp
+end
+
+RunService:BindToRenderStep(BIND_NAME, Enum.RenderPriority.Camera.Value + 1, function(dt)
+    if not session then return end
+
+    if not settings.Enabled then
+        endSession()
+        return
+    end
+
+    -- Kiểm tra các animation còn chạy không
+    local anyPlaying = false
+    for animTrack in pairs(session.tracks) do
+        local alive = animTrack.IsPlaying
+            and not (animTrack.Length > 0 and animTrack.TimePosition >= animTrack.Length)
+        if alive then
+            anyPlaying = true
+        else
+            session.tracks[animTrack] = nil
+        end
+    end
+
+    local elapsed = os.clock() - session.startTime
+    if (not anyPlaying and elapsed >= settings.MinHold) or elapsed > MAX_BLOCK_TIME then
+        endSession()
+        return
+    end
+
+    -- Xoay camera về phía người tấn công (chỉ khi họ ở phía trước)
+    if settings.TurnCamera then
+        local hrp = session.target
+        local cam = Workspace.CurrentCamera
+        local myChar = LocalPlayer.Character
+        local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+        if cam and hrp and hrp.Parent and myRoot then
+            local dir = hrp.Position - myRoot.Position
+            local flatDir = Vector3.new(dir.X, 0, dir.Z)
+            local flatLook = Vector3.new(session.savedLook.X, 0, session.savedLook.Z)
+            if flatDir.Magnitude > 0.1 and flatLook.Magnitude > 0.01
+                and flatLook.Unit:Dot(flatDir.Unit) > 0 then
+                local camPos = cam.CFrame.Position
+                local desired = CFrame.lookAt(camPos, camPos + dir)
+                local alpha = 1 - math.exp(-CAMERA_TURN_SPEED * dt)
+                cam.CFrame = cam.CFrame:Lerp(desired, alpha)
+                session.rotated = true
+            end
+        end
+    end
+end)
 
 -- ===== GUI =====
 for _, root in ipairs({ CoreGui, parentGui }) do
@@ -119,8 +210,8 @@ local Gui = create("ScreenGui", { Name = "JJS_AutoBlock", ResetOnSpawn = false, 
 
 local Panel = create("Frame", {
     Parent = Gui,
-    Position = UDim2.new(0, 40, 0, 110),
-    Size = UDim2.new(0, 300, 0, 420),
+    Position = UDim2.new(0, 40, 0, 90),
+    Size = UDim2.new(0, 310, 0, 460),
     BackgroundColor3 = T.Bg,
 }, {
     corner(10),
@@ -132,7 +223,7 @@ create("Frame", { Parent = TopBar, Position = UDim2.new(0, 0, 1, -10), Size = UD
 create("TextLabel", {
     Parent = TopBar, BackgroundTransparency = 1,
     Position = UDim2.new(0, 14, 0, 0), Size = UDim2.new(1, -60, 1, 0),
-    Font = Enum.Font.GothamBold, Text = "🛡️ JJS Auto Block", TextSize = 14,
+    Font = Enum.Font.GothamBold, Text = "🛡️ JJS Auto Block v2", TextSize = 14,
     TextColor3 = T.Accent, TextXAlignment = Enum.TextXAlignment.Left,
 })
 local CloseBtn = create("TextButton", {
@@ -142,8 +233,7 @@ local CloseBtn = create("TextButton", {
     TextSize = 12, TextColor3 = T.Text, AutoButtonColor = false,
 }, { corner(6) })
 
--- Kéo thả panel
-do
+do -- kéo thả
     local dragging, startInput, startPos = false, nil, nil
     TopBar.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1
@@ -182,23 +272,27 @@ local List = create("ScrollingFrame", {
     create("UIPadding", { PaddingRight = UDim.new(0, 6) }),
 })
 
--- Trạng thái
 local StatusLabel = create("TextLabel", {
     Parent = List, LayoutOrder = 0,
-    Size = UDim2.new(1, 0, 0, 22), BackgroundTransparency = 1,
+    Size = UDim2.new(1, 0, 0, 20), BackgroundTransparency = 1,
     Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = T.Sub,
     TextXAlignment = Enum.TextXAlignment.Left, Text = "",
 })
+local DebugLabel = create("TextLabel", {
+    Parent = List, LayoutOrder = 0.5,
+    Size = UDim2.new(1, 0, 0, 30), BackgroundTransparency = 1,
+    Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = T.Sub, TextWrapped = true,
+    TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
+    Text = "Chưa thấy animation nào.",
+})
 
-local function count(t)
-    local n = 0
-    for _ in pairs(t) do n += 1 end
-    return n
+local function setDebug(text)
+    DebugLabel.Text = text
 end
 
 local statusToken = 0
 local function refreshStatus()
-    StatusLabel.Text = ("Auto Block: %s  ·  Đòn đã chọn: %d  ·  Block: %s"):format(
+    StatusLabel.Text = ("Auto Block: %s  ·  Đã chọn: %d  ·  Phím: %s"):format(
         settings.Enabled and "BẬT" or "TẮT", count(attackSet), BLOCK_KEY.Name)
     StatusLabel.TextColor3 = settings.Enabled and T.Good or T.Sub
 end
@@ -226,7 +320,7 @@ local function toggleRow(text, default, order, callback)
     create("TextLabel", {
         Parent = f, BackgroundTransparency = 1,
         Position = UDim2.new(0, 12, 0, 0), Size = UDim2.new(1, -70, 1, 0),
-        Font = Enum.Font.Gotham, Text = text, TextSize = 13,
+        Font = Enum.Font.Gotham, Text = text, TextSize = 12,
         TextColor3 = T.Text, TextXAlignment = Enum.TextXAlignment.Left,
     })
     local pill = create("Frame", {
@@ -261,7 +355,7 @@ local function sliderRow(text, min, max, default, inc, suffix, order, callback)
     create("TextLabel", {
         Parent = f, BackgroundTransparency = 1,
         Position = UDim2.new(0, 12, 0, 5), Size = UDim2.new(1, -90, 0, 18),
-        Font = Enum.Font.Gotham, Text = text, TextSize = 13,
+        Font = Enum.Font.Gotham, Text = text, TextSize = 12,
         TextColor3 = T.Text, TextXAlignment = Enum.TextXAlignment.Left,
     })
     local valLabel = create("TextLabel", {
@@ -329,7 +423,7 @@ local function buttonRow(text, order, callback)
     local b = create("TextButton", {
         Parent = List, LayoutOrder = order,
         Size = UDim2.new(1, 0, 0, 34), BackgroundColor3 = T.Element,
-        Font = Enum.Font.GothamSemibold, Text = text, TextSize = 13,
+        Font = Enum.Font.GothamSemibold, Text = text, TextSize = 12,
         TextColor3 = T.Text, AutoButtonColor = false,
     }, { corner(8) })
     b.MouseEnter:Connect(function() tween(b, 0.12, { BackgroundColor3 = T.Hover }) end)
@@ -376,7 +470,6 @@ local function addLogRow(id, animName, playerName)
     render()
 end
 
--- Dòng log cho các ID có sẵn từ PRESET / lần chạy trước
 for id in pairs(attackSet) do
     addLogRow(id, "(đã lưu)", "—")
 end
@@ -385,22 +478,25 @@ end
 sectionLabel("Điều khiển", 1)
 local setEnabled = toggleRow("Auto Block (phím G)", false, 2, function(v)
     settings.Enabled = v
+    if not v then endSession() end
     refreshStatus()
 end)
-toggleRow("Chế độ học (ghi log animation)", false, 3, function(v)
+toggleRow("Xoay camera về phía đối thủ", true, 3, function(v) settings.TurnCamera = v end)
+toggleRow("Chỉ người gần nhất", true, 4, function(v) settings.OnlyNearest = v end)
+toggleRow("Chỉ khi đối thủ hướng về mình", false, 5, function(v) settings.Facing = v end)
+toggleRow("Chỉ block đòn đã chọn trong danh sách", false, 6, function(v) settings.OnlySelected = v end)
+toggleRow("Chế độ học (ghi log animation)", false, 7, function(v)
     settings.Learn = v
     flashStatus(v and "Đang ghi log animation của người gần bạn..." or "Đã tắt chế độ học")
 end)
-toggleRow("Chỉ người gần nhất", true, 4, function(v) settings.OnlyNearest = v end)
-toggleRow("Chỉ khi đối phương hướng về mình", true, 5, function(v) settings.Facing = v end)
 
-sectionLabel("Tuỳ chỉnh", 6)
-sliderRow("Tầm phát hiện", 5, 40, settings.Range, 1, " studs", 7, function(v) settings.Range = v end)
-sliderRow("Độ trễ phản ứng", 0, 0.5, settings.Delay, 0.01, " s", 8, function(v) settings.Delay = v end)
-sliderRow("Thời gian giữ block", 0.1, 1.5, settings.Hold, 0.05, " s", 9, function(v) settings.Hold = v end)
+sectionLabel("Tuỳ chỉnh", 8)
+sliderRow("Tầm phát hiện", 5, 50, settings.Range, 1, " studs", 9, function(v) settings.Range = v end)
+sliderRow("Độ trễ phản ứng", 0, 0.5, settings.Delay, 0.01, " s", 10, function(v) settings.Delay = v end)
+sliderRow("Giữ block tối thiểu", 0.05, 1, settings.MinHold, 0.05, " s", 11, function(v) settings.MinHold = v end)
 
-sectionLabel("Danh sách animation", 10)
-buttonRow("📋 Copy danh sách đã chọn", 11, function()
+sectionLabel("Danh sách animation", 12)
+buttonRow("📋 Copy danh sách đã chọn", 13, function()
     local lines = {}
     for id in pairs(attackSet) do
         table.insert(lines, ('    "%s",'):format(id))
@@ -416,7 +512,7 @@ buttonRow("📋 Copy danh sách đã chọn", 11, function()
         flashStatus("Executor không có clipboard, đã in ra console (F9)")
     end
 end)
-buttonRow("🗑️ Xoá log (giữ danh sách đã chọn)", 12, function()
+buttonRow("🗑️ Xoá log (giữ danh sách đã chọn)", 14, function()
     for id, row in pairs(logged) do
         if not attackSet[id] then
             row:Destroy()
@@ -429,7 +525,7 @@ end)
 
 refreshStatus()
 
--- ===== Phát hiện animation =====
+-- ===== Quét animation của người gần nhất =====
 local lastPos = setmetatable({}, { __mode = "k" })
 
 local IGNORED_PRIORITY = {
@@ -440,26 +536,49 @@ local IGNORED_PRIORITY = {
 
 local function getAnimator(char)
     local hum = char:FindFirstChildOfClass("Humanoid")
-    return hum and hum:FindFirstChildOfClass("Animator")
+    local animator = hum and hum:FindFirstChildOfClass("Animator")
+    return animator or char:FindFirstChildWhichIsA("Animator", true)
 end
 
-local function onAnimationStarted(player, hrp, myRoot, track)
-    local anim = track.Animation
+local function onFreshAnimation(player, hrp, myRoot, animTrack)
+    local anim = animTrack.Animation
     local id = anim and anim.AnimationId
     if not id or id == "" then return end
+    local name = (anim.Name ~= "" and anim.Name) or shortId(id)
+
+    if IGNORED_PRIORITY[animTrack.Priority] then
+        setDebug(("Bỏ qua (ưu tiên %s): %s"):format(animTrack.Priority.Name, name))
+        return
+    end
 
     if settings.Learn then
         addLogRow(id, anim.Name, player.Name)
     end
+    if not settings.Enabled then return end
 
-    if settings.Enabled and attackSet[id] then
-        if settings.Facing then
-            local toMe = myRoot.Position - hrp.Position
-            if toMe.Magnitude > 0 and hrp.CFrame.LookVector:Dot(toMe.Unit) < 0.25 then
-                return
-            end
+    if settings.OnlySelected and not attackSet[id] then
+        setDebug(("%s · %s: không nằm trong danh sách đã chọn"):format(player.Name, name))
+        return
+    end
+
+    if settings.Facing then
+        local toMe = myRoot.Position - hrp.Position
+        if toMe.Magnitude > 0 and hrp.CFrame.LookVector:Dot(toMe.Unit) < 0.25 then
+            setDebug(("%s · %s: đối thủ không hướng về bạn"):format(player.Name, name))
+            return
         end
-        triggerBlock()
+    end
+
+    setDebug(("🛡️ Block ← %s · %s"):format(player.Name, name))
+    local function go()
+        if animTrack.IsPlaying then
+            startOrExtend(animTrack, hrp)
+        end
+    end
+    if settings.Delay > 0 then
+        task.delay(settings.Delay, go)
+    else
+        go()
     end
 end
 
@@ -493,14 +612,14 @@ track(RunService.Heartbeat:Connect(function()
     for _, c in ipairs(candidates) do
         local animator = getAnimator(c.player.Character)
         if animator then
-            for _, t in ipairs(animator:GetPlayingAnimationTracks()) do
-                if not t.Looped and not IGNORED_PRIORITY[t.Priority] then
-                    local pos = t.TimePosition
-                    local last = lastPos[t]
+            for _, animTrack in ipairs(animator:GetPlayingAnimationTracks()) do
+                if not animTrack.Looped then
+                    local pos = animTrack.TimePosition
+                    local last = lastPos[animTrack]
                     local fresh = (last == nil and pos < 0.25) or (last ~= nil and pos < last - 0.05)
-                    lastPos[t] = pos
+                    lastPos[animTrack] = pos
                     if fresh then
-                        onAnimationStarted(c.player, c.hrp, myRoot, t)
+                        onFreshAnimation(c.player, c.hrp, myRoot, animTrack)
                     end
                 end
             end
@@ -511,19 +630,20 @@ end))
 -- ===== Phím tắt + dọn dẹp =====
 track(UserInputService.InputBegan:Connect(function(input, gp)
     if not gp and input.KeyCode == TOGGLE_KEY then
-        local newState = not settings.Enabled
-        setEnabled(newState)
+        setEnabled(not settings.Enabled)
     end
 end))
 
 local function cleanup()
     settings.Enabled = false
     settings.Learn = false
+    endSession()
+    pressBlock(false)
+    pcall(function() RunService:UnbindFromRenderStep(BIND_NAME) end)
     for _, c in ipairs(connections) do
         pcall(function() c:Disconnect() end)
     end
     table.clear(connections)
-    if blocking then pressBlock(false) end
     Gui:Destroy()
     env.JJS_AutoBlockCleanup = nil
 end
