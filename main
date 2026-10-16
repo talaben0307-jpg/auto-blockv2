@@ -1,14 +1,14 @@
 --[[
-    JJS Auto Block v2
-    Quét animation của người gần nhất:
-      - Có animation tấn công -> xoay camera về phía họ (nếu họ ở phía trước bạn)
+    JJS Auto Block v4
+    Tự quét animation của người gần nhất, CHỈ block đòn đánh (M1) và lướt (Dash):
+      - Xoay NGƯỜI (không đổi góc nhìn camera) về phía họ
       - Giữ phím block đến khi animation đó kết thúc
-      - Xong thì trả camera về góc nhìn ban đầu
-      - Nếu họ ở phía sau lưng: vẫn block nhưng KHÔNG đổi góc nhìn
 
-    Mặc định phản ứng với mọi animation không lặp của người gần nhất.
-    Muốn lọc chính xác hơn: bật "Chế độ học", chọn các đòn cần block,
-    rồi bật "Chỉ đòn đã chọn".
+    Phân loại animation:
+      1. Chính xác nhất: bật "Chế độ học", để người khác đánh/lướt gần bạn,
+         rồi bấm vào từng dòng log để đổi loại: ? -> M1 -> Dash -> ?
+      2. Đoán theo tên animation (M1_KEYWORDS / DASH_KEYWORDS bên dưới) - chỉ là ước đoán.
+    Animation chưa phân loại sẽ bị bỏ qua khi bật "Chỉ block đánh/lướt".
 ]]
 
 local Players = game:GetService("Players")
@@ -25,10 +25,14 @@ local BLOCK_KEY = Enum.KeyCode.F    -- phím block trong game
 local TOGGLE_KEY = Enum.KeyCode.G   -- bật/tắt Auto Block nhanh
 local USE_KEYPRESS = false          -- true: dùng keypress()/keyrelease() của executor thay cho VirtualInputManager
 local MAX_BLOCK_TIME = 4            -- giây, giới hạn an toàn cho một lần giữ block
-local CAMERA_TURN_SPEED = 35        -- càng cao càng xoay nhanh
+local BODY_TURN_SPEED = 30          -- càng cao càng xoay người nhanh
 local PRESET_ANIMS = {
-    -- "rbxassetid://1234567890",
+    -- ["rbxassetid://1234567890"] = "M1",
+    -- ["rbxassetid://1234567891"] = "Dash",
 }
+-- Từ khoá để đoán loại theo tên animation (chữ thường, chỉ là ước đoán)
+local M1_KEYWORDS = { "m1", "punch", "attack", "combo", "swing", "slash", "strike", "hit" }
+local DASH_KEYWORDS = { "dash", "slide", "sidestep" }
 
 -- ===== Dọn bản chạy trước =====
 local env = (getgenv and getgenv()) or _G
@@ -40,17 +44,21 @@ local parentGui = (gethui and gethui()) or CoreGui
 local connections = {}
 local function track(c) table.insert(connections, c) return c end
 
-env.JJS_AutoBlockAnims = env.JJS_AutoBlockAnims or {}
-local attackSet = env.JJS_AutoBlockAnims
-for _, id in ipairs(PRESET_ANIMS) do
-    attackSet[id] = true
+env.JJS_AutoBlockCats = env.JJS_AutoBlockCats or {}
+local catSet = env.JJS_AutoBlockCats   -- [AnimationId] = "M1" | "Dash"
+for id, cat in pairs(PRESET_ANIMS) do
+    catSet[id] = cat
 end
 
 local settings = {
     Enabled = false,
     Learn = false,
-    OnlySelected = false,
-    TurnCamera = true,
+    FilterTypes = true,
+    BlockM1 = true,
+    BlockDash = true,
+    TurnBody = true,
+    RestoreFacing = false,
+    SkipBehind = false,
     OnlyNearest = true,
     Facing = false,
     Range = 20,
@@ -118,19 +126,27 @@ local function pressBlock(down)
 end
 
 -- ===== Phiên block (session) =====
--- session = { tracks = {[AnimationTrack] = true}, startTime, savedLook, rotated, target(hrp) }
+-- session = { tracks = {[AnimationTrack] = true}, startTime, savedLook, autoRotate, turned, target(hrp) }
 local session = nil
-local BIND_NAME = "JJS_AutoBlockCam"
+local BIND_NAME = "JJS_AutoBlockTurn"
+
+local function getMyParts()
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    return root, hum
+end
 
 local function endSession()
     if not session then return end
     pressBlock(false)
-    if session.rotated and session.savedLook then
-        local cam = Workspace.CurrentCamera
-        if cam then
-            local pos = cam.CFrame.Position
-            cam.CFrame = CFrame.lookAt(pos, pos + session.savedLook)
-        end
+    local root, hum = getMyParts()
+    if hum and session.autoRotate ~= nil then
+        hum.AutoRotate = session.autoRotate
+    end
+    if root and session.turned and settings.RestoreFacing and session.savedLook then
+        local pos = root.Position
+        root.CFrame = CFrame.lookAt(pos, pos + session.savedLook)
     end
     session = nil
 end
@@ -138,14 +154,21 @@ end
 local function startOrExtend(animTrack, hrp)
     if not settings.Enabled then return end
     if not session then
-        local cam = Workspace.CurrentCamera
+        local root, hum = getMyParts()
+        local look = root and root.CFrame.LookVector or Vector3.new(0, 0, -1)
+        local flat = Vector3.new(look.X, 0, look.Z)
+        if flat.Magnitude < 0.01 then flat = Vector3.new(0, 0, -1) end
         session = {
             tracks = {},
             startTime = os.clock(),
-            savedLook = cam and cam.CFrame.LookVector or Vector3.new(0, 0, -1),
-            rotated = false,
+            savedLook = flat.Unit,
+            autoRotate = hum and hum.AutoRotate,
+            turned = false,
             target = nil,
         }
+        if settings.TurnBody and hum then
+            hum.AutoRotate = false
+        end
         pressBlock(true)
     end
     session.tracks[animTrack] = true
@@ -178,23 +201,22 @@ RunService:BindToRenderStep(BIND_NAME, Enum.RenderPriority.Camera.Value + 1, fun
         return
     end
 
-    -- Xoay camera về phía người tấn công (chỉ khi họ ở phía trước)
-    if settings.TurnCamera then
+    -- Xoay người (không động tới camera) về phía người tấn công
+    if settings.TurnBody then
         local hrp = session.target
-        local cam = Workspace.CurrentCamera
-        local myChar = LocalPlayer.Character
-        local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
-        if cam and hrp and hrp.Parent and myRoot then
-            local dir = hrp.Position - myRoot.Position
+        local root = getMyParts()
+        if hrp and hrp.Parent and root then
+            local dir = hrp.Position - root.Position
             local flatDir = Vector3.new(dir.X, 0, dir.Z)
-            local flatLook = Vector3.new(session.savedLook.X, 0, session.savedLook.Z)
-            if flatDir.Magnitude > 0.1 and flatLook.Magnitude > 0.01
-                and flatLook.Unit:Dot(flatDir.Unit) > 0 then
-                local camPos = cam.CFrame.Position
-                local desired = CFrame.lookAt(camPos, camPos + dir)
-                local alpha = 1 - math.exp(-CAMERA_TURN_SPEED * dt)
-                cam.CFrame = cam.CFrame:Lerp(desired, alpha)
-                session.rotated = true
+            if flatDir.Magnitude > 0.1 then
+                local behind = session.savedLook:Dot(flatDir.Unit) <= 0
+                if not (settings.SkipBehind and behind) then
+                    local pos = root.Position
+                    local desired = CFrame.lookAt(pos, pos + flatDir)
+                    local alpha = 1 - math.exp(-BODY_TURN_SPEED * dt)
+                    root.CFrame = root.CFrame:Lerp(desired, alpha)
+                    session.turned = true
+                end
             end
         end
     end
@@ -223,7 +245,7 @@ create("Frame", { Parent = TopBar, Position = UDim2.new(0, 0, 1, -10), Size = UD
 create("TextLabel", {
     Parent = TopBar, BackgroundTransparency = 1,
     Position = UDim2.new(0, 14, 0, 0), Size = UDim2.new(1, -60, 1, 0),
-    Font = Enum.Font.GothamBold, Text = "🛡️ JJS Auto Block v2", TextSize = 14,
+    Font = Enum.Font.GothamBold, Text = "🛡️ JJS Auto Block v4", TextSize = 14,
     TextColor3 = T.Accent, TextXAlignment = Enum.TextXAlignment.Left,
 })
 local CloseBtn = create("TextButton", {
@@ -279,7 +301,7 @@ local StatusLabel = create("TextLabel", {
     TextXAlignment = Enum.TextXAlignment.Left, Text = "",
 })
 local DebugLabel = create("TextLabel", {
-    Parent = List, LayoutOrder = 0.5,
+    Parent = List, LayoutOrder = 1,
     Size = UDim2.new(1, 0, 0, 30), BackgroundTransparency = 1,
     Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = T.Sub, TextWrapped = true,
     TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
@@ -292,8 +314,8 @@ end
 
 local statusToken = 0
 local function refreshStatus()
-    StatusLabel.Text = ("Auto Block: %s  ·  Đã chọn: %d  ·  Phím: %s"):format(
-        settings.Enabled and "BẬT" or "TẮT", count(attackSet), BLOCK_KEY.Name)
+    StatusLabel.Text = ("Auto Block: %s  ·  Đã gán loại: %d  ·  Phím: %s"):format(
+        settings.Enabled and "BẬT" or "TẮT", count(catSet), BLOCK_KEY.Name)
     StatusLabel.TextColor3 = settings.Enabled and T.Good or T.Sub
 end
 local function flashStatus(text)
@@ -440,9 +462,21 @@ local function shortId(id)
     return id:match("%d+") or id
 end
 
+local function guessCategory(name)
+    local n = string.lower(name or "")
+    for _, k in ipairs(DASH_KEYWORDS) do
+        if n:find(k, 1, true) then return "Dash" end
+    end
+    for _, k in ipairs(M1_KEYWORDS) do
+        if n:find(k, 1, true) then return "M1" end
+    end
+    return nil
+end
+
 local function addLogRow(id, animName, playerName)
     if logged[id] or logCount >= MAX_LOG then return end
     logCount += 1
+    local displayName = (animName ~= "" and animName) or "(không tên)"
     local row = create("TextButton", {
         Parent = List, LayoutOrder = 100 + logCount,
         Size = UDim2.new(1, 0, 0, 38), BackgroundColor3 = T.Element,
@@ -454,15 +488,32 @@ local function addLogRow(id, animName, playerName)
         Position = UDim2.new(0, 10, 0, 0), Size = UDim2.new(1, -20, 1, 0),
         Font = Enum.Font.Gotham, TextSize = 11, TextWrapped = true,
         TextColor3 = T.Text, TextXAlignment = Enum.TextXAlignment.Left,
-        Text = ("%s  ·  %s\n%s"):format(animName ~= "" and animName or "(không tên)", playerName, shortId(id)),
+        Text = "",
     })
     local function render()
-        local on = attackSet[id] == true
-        stroke.Color = on and T.Good or T.Stroke
-        label.TextColor3 = on and T.Good or T.Text
+        local cat = catSet[id]
+        local tag, color
+        if cat == "M1" then
+            tag, color = "[M1]", T.Good
+        elseif cat == "Dash" then
+            tag, color = "[Dash]", T.Accent
+        else
+            local guess = guessCategory(animName)
+            tag = guess and ("[? đoán " .. guess .. "]") or "[?]"
+        end
+        stroke.Color = color or T.Stroke
+        label.TextColor3 = color or T.Text
+        label.Text = ("%s %s  ·  %s\n%s"):format(tag, displayName, playerName, shortId(id))
     end
     row.MouseButton1Click:Connect(function()
-        attackSet[id] = (not attackSet[id]) or nil
+        local cur = catSet[id]
+        if cur == nil then
+            catSet[id] = "M1"
+        elseif cur == "M1" then
+            catSet[id] = "Dash"
+        else
+            catSet[id] = nil
+        end
         render()
         refreshStatus()
     end)
@@ -470,36 +521,40 @@ local function addLogRow(id, animName, playerName)
     render()
 end
 
-for id in pairs(attackSet) do
+for id in pairs(catSet) do
     addLogRow(id, "(đã lưu)", "—")
 end
 
 -- ===== Điều khiển =====
-sectionLabel("Điều khiển", 1)
-local setEnabled = toggleRow("Auto Block (phím G)", false, 2, function(v)
+sectionLabel("Điều khiển", 2)
+local setEnabled = toggleRow("Auto Block (phím G)", false, 3, function(v)
     settings.Enabled = v
     if not v then endSession() end
     refreshStatus()
 end)
-toggleRow("Xoay camera về phía đối thủ", true, 3, function(v) settings.TurnCamera = v end)
-toggleRow("Chỉ người gần nhất", true, 4, function(v) settings.OnlyNearest = v end)
-toggleRow("Chỉ khi đối thủ hướng về mình", false, 5, function(v) settings.Facing = v end)
-toggleRow("Chỉ block đòn đã chọn trong danh sách", false, 6, function(v) settings.OnlySelected = v end)
-toggleRow("Chế độ học (ghi log animation)", false, 7, function(v)
+toggleRow("Chỉ block đánh / lướt (lọc theo loại)", true, 4, function(v) settings.FilterTypes = v end)
+toggleRow("   Block đòn đánh (M1)", true, 5, function(v) settings.BlockM1 = v end)
+toggleRow("   Block lướt (Dash)", true, 6, function(v) settings.BlockDash = v end)
+toggleRow("Xoay người về phía đối thủ", true, 7, function(v) settings.TurnBody = v end)
+toggleRow("Trả hướng người về như cũ sau block", false, 8, function(v) settings.RestoreFacing = v end)
+toggleRow("Không xoay khi đối thủ ở sau lưng", false, 9, function(v) settings.SkipBehind = v end)
+toggleRow("Chỉ người gần nhất", true, 10, function(v) settings.OnlyNearest = v end)
+toggleRow("Chỉ khi đối thủ hướng về mình", false, 11, function(v) settings.Facing = v end)
+toggleRow("Chế độ học (ghi log animation)", false, 12, function(v)
     settings.Learn = v
-    flashStatus(v and "Đang ghi log animation của người gần bạn..." or "Đã tắt chế độ học")
+    flashStatus(v and "Học: bấm vào dòng log để đổi loại ? > M1 > Dash" or "Đã tắt chế độ học")
 end)
 
-sectionLabel("Tuỳ chỉnh", 8)
-sliderRow("Tầm phát hiện", 5, 50, settings.Range, 1, " studs", 9, function(v) settings.Range = v end)
-sliderRow("Độ trễ phản ứng", 0, 0.5, settings.Delay, 0.01, " s", 10, function(v) settings.Delay = v end)
-sliderRow("Giữ block tối thiểu", 0.05, 1, settings.MinHold, 0.05, " s", 11, function(v) settings.MinHold = v end)
+sectionLabel("Tuỳ chỉnh", 13)
+sliderRow("Tầm phát hiện", 5, 50, settings.Range, 1, " studs", 14, function(v) settings.Range = v end)
+sliderRow("Độ trễ phản ứng", 0, 0.5, settings.Delay, 0.01, " s", 15, function(v) settings.Delay = v end)
+sliderRow("Giữ block tối thiểu", 0.05, 1, settings.MinHold, 0.05, " s", 16, function(v) settings.MinHold = v end)
 
-sectionLabel("Danh sách animation", 12)
-buttonRow("📋 Copy danh sách đã chọn", 13, function()
+sectionLabel("Danh sách animation", 17)
+buttonRow("📋 Copy danh sách đã gán loại", 18, function()
     local lines = {}
-    for id in pairs(attackSet) do
-        table.insert(lines, ('    "%s",'):format(id))
+    for id, cat in pairs(catSet) do
+        table.insert(lines, ('    ["%s"] = "%s",'):format(id, cat))
     end
     table.sort(lines)
     local s = "local PRESET_ANIMS = {\n" .. table.concat(lines, "\n") .. "\n}"
@@ -507,14 +562,14 @@ buttonRow("📋 Copy danh sách đã chọn", 13, function()
     local copy = setclipboard or toclipboard
     if copy then
         copy(s)
-        flashStatus("Đã copy " .. #lines .. " ID vào clipboard")
+        flashStatus("Đã copy " .. #lines .. " animation vào clipboard")
     else
         flashStatus("Executor không có clipboard, đã in ra console (F9)")
     end
 end)
-buttonRow("🗑️ Xoá log (giữ danh sách đã chọn)", 14, function()
+buttonRow("🗑️ Xoá log (giữ animation đã gán loại)", 19, function()
     for id, row in pairs(logged) do
-        if not attackSet[id] then
+        if not catSet[id] then
             row:Destroy()
             logged[id] = nil
         end
@@ -556,9 +611,16 @@ local function onFreshAnimation(player, hrp, myRoot, animTrack)
     end
     if not settings.Enabled then return end
 
-    if settings.OnlySelected and not attackSet[id] then
-        setDebug(("%s · %s: không nằm trong danh sách đã chọn"):format(player.Name, name))
-        return
+    local cat = catSet[id] or guessCategory(anim.Name)
+    if settings.FilterTypes then
+        if not cat then
+            setDebug(("Chưa phân loại: %s — dùng chế độ học để gán M1/Dash"):format(name))
+            return
+        end
+        if (cat == "M1" and not settings.BlockM1) or (cat == "Dash" and not settings.BlockDash) then
+            setDebug(("Bỏ qua [%s] %s (đang tắt loại này)"):format(cat, name))
+            return
+        end
     end
 
     if settings.Facing then
@@ -569,7 +631,7 @@ local function onFreshAnimation(player, hrp, myRoot, animTrack)
         end
     end
 
-    setDebug(("🛡️ Block ← %s · %s"):format(player.Name, name))
+    setDebug(("🛡️ Block [%s] ← %s · %s"):format(cat or "?", player.Name, name))
     local function go()
         if animTrack.IsPlaying then
             startOrExtend(animTrack, hrp)
