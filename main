@@ -1,0 +1,531 @@
+--[[
+    JJS Auto Block
+    Nhận diện animation tấn công của người gần nhất rồi tự giữ phím block.
+
+    Cách dùng:
+      1. Bật "Chế độ học" -> để người khác tung chiêu gần bạn.
+      2. Mỗi animation lạ xuất hiện trong danh sách log; bấm vào dòng để chọn nó là "đòn cần block".
+      3. Tắt "Chế độ học", bật "Auto Block" (hoặc nhấn phím G).
+    Bấm "Copy danh sách" để lưu ID, rồi dán vào PRESET_ANIMS lần sau.
+]]
+
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local CoreGui = game:GetService("CoreGui")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local LocalPlayer = Players.LocalPlayer
+
+-- ===== Cấu hình =====
+local BLOCK_KEY = Enum.KeyCode.F   -- đổi theo phím block trong game
+local TOGGLE_KEY = Enum.KeyCode.G  -- bật/tắt Auto Block nhanh
+local PRESET_ANIMS = {
+    -- "rbxassetid://1234567890",
+}
+
+-- ===== Dọn bản chạy trước =====
+local env = (getgenv and getgenv()) or _G
+if env.JJS_AutoBlockCleanup then
+    pcall(env.JJS_AutoBlockCleanup)
+end
+
+local parentGui = (gethui and gethui()) or CoreGui
+local connections = {}
+local function track(c) table.insert(connections, c) return c end
+
+-- Danh sách animation được giữ lại giữa các lần chạy lại script
+env.JJS_AutoBlockAnims = env.JJS_AutoBlockAnims or {}
+local attackSet = env.JJS_AutoBlockAnims
+for _, id in ipairs(PRESET_ANIMS) do
+    attackSet[id] = true
+end
+
+local settings = {
+    Enabled = false,
+    Learn = false,
+    Range = 15,
+    Delay = 0,
+    Hold = 0.5,
+    OnlyNearest = true,
+    Facing = true,
+}
+
+-- ===== Theme + helper =====
+local T = {
+    Bg = Color3.fromRGB(13, 13, 19),
+    Panel = Color3.fromRGB(19, 19, 28),
+    Element = Color3.fromRGB(26, 26, 38),
+    Hover = Color3.fromRGB(36, 36, 52),
+    Off = Color3.fromRGB(52, 52, 72),
+    Stroke = Color3.fromRGB(44, 44, 64),
+    Accent = Color3.fromRGB(0, 229, 255),
+    Good = Color3.fromRGB(70, 220, 120),
+    Text = Color3.fromRGB(238, 238, 245),
+    Sub = Color3.fromRGB(150, 150, 172),
+    Danger = Color3.fromRGB(255, 70, 70),
+}
+
+local function create(class, props, children)
+    local inst = Instance.new(class)
+    if inst:IsA("GuiObject") then inst.BorderSizePixel = 0 end
+    local parent
+    for k, v in pairs(props or {}) do
+        if k == "Parent" then parent = v else inst[k] = v end
+    end
+    for _, ch in ipairs(children or {}) do ch.Parent = inst end
+    inst.Parent = parent
+    return inst
+end
+
+local function tween(inst, t, props)
+    TweenService:Create(inst, TweenInfo.new(t, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
+end
+
+local function corner(r) return create("UICorner", { CornerRadius = UDim.new(0, r) }) end
+
+-- ===== Block =====
+local blocking = false
+local blockUntil = 0
+
+local function pressBlock(down)
+    pcall(function()
+        VirtualInputManager:SendKeyEvent(down, BLOCK_KEY, false, game)
+    end)
+end
+
+local function triggerBlock()
+    task.delay(settings.Delay, function()
+        blockUntil = math.max(blockUntil, os.clock() + settings.Hold)
+        if blocking then return end
+        blocking = true
+        pressBlock(true)
+        while os.clock() < blockUntil and settings.Enabled do
+            task.wait()
+        end
+        pressBlock(false)
+        blocking = false
+    end)
+end
+
+-- ===== GUI =====
+for _, root in ipairs({ CoreGui, parentGui }) do
+    local old = root:FindFirstChild("JJS_AutoBlock")
+    if old then old:Destroy() end
+end
+
+local Gui = create("ScreenGui", { Name = "JJS_AutoBlock", ResetOnSpawn = false, Parent = parentGui })
+
+local Panel = create("Frame", {
+    Parent = Gui,
+    Position = UDim2.new(0, 40, 0, 110),
+    Size = UDim2.new(0, 300, 0, 420),
+    BackgroundColor3 = T.Bg,
+}, {
+    corner(10),
+    create("UIStroke", { Color = T.Accent, Thickness = 1.5, Transparency = 0.3 }),
+})
+
+local TopBar = create("Frame", { Parent = Panel, Size = UDim2.new(1, 0, 0, 40), BackgroundColor3 = T.Panel }, { corner(10) })
+create("Frame", { Parent = TopBar, Position = UDim2.new(0, 0, 1, -10), Size = UDim2.new(1, 0, 0, 10), BackgroundColor3 = T.Panel })
+create("TextLabel", {
+    Parent = TopBar, BackgroundTransparency = 1,
+    Position = UDim2.new(0, 14, 0, 0), Size = UDim2.new(1, -60, 1, 0),
+    Font = Enum.Font.GothamBold, Text = "🛡️ JJS Auto Block", TextSize = 14,
+    TextColor3 = T.Accent, TextXAlignment = Enum.TextXAlignment.Left,
+})
+local CloseBtn = create("TextButton", {
+    Parent = TopBar, AnchorPoint = Vector2.new(1, 0.5),
+    Position = UDim2.new(1, -10, 0.5, 0), Size = UDim2.new(0, 26, 0, 26),
+    BackgroundColor3 = T.Element, Font = Enum.Font.GothamBold, Text = "X",
+    TextSize = 12, TextColor3 = T.Text, AutoButtonColor = false,
+}, { corner(6) })
+
+-- Kéo thả panel
+do
+    local dragging, startInput, startPos = false, nil, nil
+    TopBar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            startInput = input.Position
+            startPos = Panel.Position
+        end
+    end)
+    track(UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch) then
+            local d = input.Position - startInput
+            Panel.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end))
+    track(UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end))
+end
+
+local List = create("ScrollingFrame", {
+    Parent = Panel,
+    BackgroundTransparency = 1,
+    Position = UDim2.new(0, 10, 0, 48),
+    Size = UDim2.new(1, -20, 1, -58),
+    CanvasSize = UDim2.new(0, 0, 0, 0),
+    AutomaticCanvasSize = Enum.AutomaticSize.Y,
+    ScrollBarThickness = 3,
+    ScrollBarImageColor3 = T.Accent,
+}, {
+    create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 6) }),
+    create("UIPadding", { PaddingRight = UDim.new(0, 6) }),
+})
+
+-- Trạng thái
+local StatusLabel = create("TextLabel", {
+    Parent = List, LayoutOrder = 0,
+    Size = UDim2.new(1, 0, 0, 22), BackgroundTransparency = 1,
+    Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = T.Sub,
+    TextXAlignment = Enum.TextXAlignment.Left, Text = "",
+})
+
+local function count(t)
+    local n = 0
+    for _ in pairs(t) do n += 1 end
+    return n
+end
+
+local statusToken = 0
+local function refreshStatus()
+    StatusLabel.Text = ("Auto Block: %s  ·  Đòn đã chọn: %d  ·  Block: %s"):format(
+        settings.Enabled and "BẬT" or "TẮT", count(attackSet), BLOCK_KEY.Name)
+    StatusLabel.TextColor3 = settings.Enabled and T.Good or T.Sub
+end
+local function flashStatus(text)
+    statusToken += 1
+    local my = statusToken
+    StatusLabel.Text = text
+    StatusLabel.TextColor3 = T.Accent
+    task.delay(2, function()
+        if my == statusToken then refreshStatus() end
+    end)
+end
+
+local function sectionLabel(text, order)
+    create("TextLabel", {
+        Parent = List, LayoutOrder = order,
+        Size = UDim2.new(1, 0, 0, 20), BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold, Text = string.upper(text), TextSize = 11,
+        TextColor3 = T.Accent, TextXAlignment = Enum.TextXAlignment.Left,
+    })
+end
+
+local function toggleRow(text, default, order, callback)
+    local f = create("Frame", { Parent = List, LayoutOrder = order, Size = UDim2.new(1, 0, 0, 36), BackgroundColor3 = T.Element }, { corner(8) })
+    create("TextLabel", {
+        Parent = f, BackgroundTransparency = 1,
+        Position = UDim2.new(0, 12, 0, 0), Size = UDim2.new(1, -70, 1, 0),
+        Font = Enum.Font.Gotham, Text = text, TextSize = 13,
+        TextColor3 = T.Text, TextXAlignment = Enum.TextXAlignment.Left,
+    })
+    local pill = create("Frame", {
+        Parent = f, AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, -12, 0.5, 0), Size = UDim2.new(0, 40, 0, 20),
+        BackgroundColor3 = T.Off,
+    }, { corner(10) })
+    local knob = create("Frame", {
+        Parent = pill, AnchorPoint = Vector2.new(0, 0.5),
+        Position = UDim2.new(0, 3, 0.5, 0), Size = UDim2.new(0, 14, 0, 14),
+        BackgroundColor3 = T.Text,
+    }, { corner(7) })
+    local hit = create("TextButton", { Parent = f, Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, Text = "" })
+
+    local value = default
+    local function render()
+        tween(pill, 0.15, { BackgroundColor3 = value and T.Accent or T.Off })
+        tween(knob, 0.15, { Position = value and UDim2.new(1, -17, 0.5, 0) or UDim2.new(0, 3, 0.5, 0) })
+    end
+    local function set(v, silent)
+        value = v
+        render()
+        if not silent then callback(v) end
+    end
+    hit.MouseButton1Click:Connect(function() set(not value) end)
+    render()
+    return set
+end
+
+local function sliderRow(text, min, max, default, inc, suffix, order, callback)
+    local f = create("Frame", { Parent = List, LayoutOrder = order, Size = UDim2.new(1, 0, 0, 50), BackgroundColor3 = T.Element }, { corner(8) })
+    create("TextLabel", {
+        Parent = f, BackgroundTransparency = 1,
+        Position = UDim2.new(0, 12, 0, 5), Size = UDim2.new(1, -90, 0, 18),
+        Font = Enum.Font.Gotham, Text = text, TextSize = 13,
+        TextColor3 = T.Text, TextXAlignment = Enum.TextXAlignment.Left,
+    })
+    local valLabel = create("TextLabel", {
+        Parent = f, BackgroundTransparency = 1, AnchorPoint = Vector2.new(1, 0),
+        Position = UDim2.new(1, -12, 0, 5), Size = UDim2.new(0, 70, 0, 18),
+        Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = T.Accent,
+        TextXAlignment = Enum.TextXAlignment.Right, Text = "",
+    })
+    local bar = create("Frame", {
+        Parent = f, Position = UDim2.new(0, 12, 0, 32), Size = UDim2.new(1, -24, 0, 6),
+        BackgroundColor3 = T.Off,
+    }, { corner(3) })
+    local fill = create("Frame", { Parent = bar, Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = T.Accent }, { corner(3) })
+    local knob = create("Frame", {
+        Parent = bar, AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.new(0, 0, 0.5, 0), Size = UDim2.new(0, 14, 0, 14),
+        BackgroundColor3 = T.Text,
+    }, { corner(7) })
+    local hit = create("TextButton", {
+        Parent = f, Position = UDim2.new(0, 6, 0, 22), Size = UDim2.new(1, -12, 0, 26),
+        BackgroundTransparency = 1, Text = "",
+    })
+
+    local value = default
+    local function render()
+        local a = (value - min) / (max - min)
+        fill.Size = UDim2.new(a, 0, 1, 0)
+        knob.Position = UDim2.new(a, 0, 0.5, 0)
+        valLabel.Text = tostring(value) .. suffix
+    end
+    local function set(v)
+        v = math.clamp(math.floor(v / inc + 0.5) * inc, min, max)
+        value = tonumber(string.format("%.3f", v))
+        render()
+        callback(value)
+    end
+    local sliding = false
+    local function fromX(x)
+        local a = math.clamp((x - bar.AbsolutePosition.X) / bar.AbsoluteSize.X, 0, 1)
+        set(min + a * (max - min))
+    end
+    hit.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            sliding = true
+            fromX(input.Position.X)
+        end
+    end)
+    track(UserInputService.InputChanged:Connect(function(input)
+        if sliding and (input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch) then
+            fromX(input.Position.X)
+        end
+    end))
+    track(UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            sliding = false
+        end
+    end))
+    render()
+end
+
+local function buttonRow(text, order, callback)
+    local b = create("TextButton", {
+        Parent = List, LayoutOrder = order,
+        Size = UDim2.new(1, 0, 0, 34), BackgroundColor3 = T.Element,
+        Font = Enum.Font.GothamSemibold, Text = text, TextSize = 13,
+        TextColor3 = T.Text, AutoButtonColor = false,
+    }, { corner(8) })
+    b.MouseEnter:Connect(function() tween(b, 0.12, { BackgroundColor3 = T.Hover }) end)
+    b.MouseLeave:Connect(function() tween(b, 0.12, { BackgroundColor3 = T.Element }) end)
+    b.MouseButton1Click:Connect(callback)
+end
+
+-- ===== Log animation =====
+local logged = {}
+local logCount = 0
+local MAX_LOG = 60
+
+local function shortId(id)
+    return id:match("%d+") or id
+end
+
+local function addLogRow(id, animName, playerName)
+    if logged[id] or logCount >= MAX_LOG then return end
+    logCount += 1
+    local row = create("TextButton", {
+        Parent = List, LayoutOrder = 100 + logCount,
+        Size = UDim2.new(1, 0, 0, 38), BackgroundColor3 = T.Element,
+        Text = "", AutoButtonColor = false,
+    }, { corner(8) })
+    local stroke = create("UIStroke", { Parent = row, Color = T.Stroke, Thickness = 1 })
+    local label = create("TextLabel", {
+        Parent = row, BackgroundTransparency = 1,
+        Position = UDim2.new(0, 10, 0, 0), Size = UDim2.new(1, -20, 1, 0),
+        Font = Enum.Font.Gotham, TextSize = 11, TextWrapped = true,
+        TextColor3 = T.Text, TextXAlignment = Enum.TextXAlignment.Left,
+        Text = ("%s  ·  %s\n%s"):format(animName ~= "" and animName or "(không tên)", playerName, shortId(id)),
+    })
+    local function render()
+        local on = attackSet[id] == true
+        stroke.Color = on and T.Good or T.Stroke
+        label.TextColor3 = on and T.Good or T.Text
+    end
+    row.MouseButton1Click:Connect(function()
+        attackSet[id] = (not attackSet[id]) or nil
+        render()
+        refreshStatus()
+    end)
+    logged[id] = row
+    render()
+end
+
+-- Dòng log cho các ID có sẵn từ PRESET / lần chạy trước
+for id in pairs(attackSet) do
+    addLogRow(id, "(đã lưu)", "—")
+end
+
+-- ===== Điều khiển =====
+sectionLabel("Điều khiển", 1)
+local setEnabled = toggleRow("Auto Block (phím G)", false, 2, function(v)
+    settings.Enabled = v
+    refreshStatus()
+end)
+toggleRow("Chế độ học (ghi log animation)", false, 3, function(v)
+    settings.Learn = v
+    flashStatus(v and "Đang ghi log animation của người gần bạn..." or "Đã tắt chế độ học")
+end)
+toggleRow("Chỉ người gần nhất", true, 4, function(v) settings.OnlyNearest = v end)
+toggleRow("Chỉ khi đối phương hướng về mình", true, 5, function(v) settings.Facing = v end)
+
+sectionLabel("Tuỳ chỉnh", 6)
+sliderRow("Tầm phát hiện", 5, 40, settings.Range, 1, " studs", 7, function(v) settings.Range = v end)
+sliderRow("Độ trễ phản ứng", 0, 0.5, settings.Delay, 0.01, " s", 8, function(v) settings.Delay = v end)
+sliderRow("Thời gian giữ block", 0.1, 1.5, settings.Hold, 0.05, " s", 9, function(v) settings.Hold = v end)
+
+sectionLabel("Danh sách animation", 10)
+buttonRow("📋 Copy danh sách đã chọn", 11, function()
+    local lines = {}
+    for id in pairs(attackSet) do
+        table.insert(lines, ('    "%s",'):format(id))
+    end
+    table.sort(lines)
+    local s = "local PRESET_ANIMS = {\n" .. table.concat(lines, "\n") .. "\n}"
+    print(s)
+    local copy = setclipboard or toclipboard
+    if copy then
+        copy(s)
+        flashStatus("Đã copy " .. #lines .. " ID vào clipboard")
+    else
+        flashStatus("Executor không có clipboard, đã in ra console (F9)")
+    end
+end)
+buttonRow("🗑️ Xoá log (giữ danh sách đã chọn)", 12, function()
+    for id, row in pairs(logged) do
+        if not attackSet[id] then
+            row:Destroy()
+            logged[id] = nil
+        end
+    end
+    logCount = count(logged)
+    flashStatus("Đã xoá log")
+end)
+
+refreshStatus()
+
+-- ===== Phát hiện animation =====
+local lastPos = setmetatable({}, { __mode = "k" })
+
+local IGNORED_PRIORITY = {
+    [Enum.AnimationPriority.Core] = true,
+    [Enum.AnimationPriority.Idle] = true,
+    [Enum.AnimationPriority.Movement] = true,
+}
+
+local function getAnimator(char)
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    return hum and hum:FindFirstChildOfClass("Animator")
+end
+
+local function onAnimationStarted(player, hrp, myRoot, track)
+    local anim = track.Animation
+    local id = anim and anim.AnimationId
+    if not id or id == "" then return end
+
+    if settings.Learn then
+        addLogRow(id, anim.Name, player.Name)
+    end
+
+    if settings.Enabled and attackSet[id] then
+        if settings.Facing then
+            local toMe = myRoot.Position - hrp.Position
+            if toMe.Magnitude > 0 and hrp.CFrame.LookVector:Dot(toMe.Unit) < 0.25 then
+                return
+            end
+        end
+        triggerBlock()
+    end
+end
+
+track(RunService.Heartbeat:Connect(function()
+    if not (settings.Enabled or settings.Learn) then return end
+
+    local myChar = LocalPlayer.Character
+    local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+    if not myRoot then return end
+
+    local candidates = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and p.Character then
+            local hrp = p.Character:FindFirstChild("HumanoidRootPart")
+            local hum = p.Character:FindFirstChildOfClass("Humanoid")
+            if hrp and hum and hum.Health > 0 then
+                local dist = (hrp.Position - myRoot.Position).Magnitude
+                if dist <= settings.Range then
+                    table.insert(candidates, { player = p, hrp = hrp, dist = dist })
+                end
+            end
+        end
+    end
+    if #candidates == 0 then return end
+
+    table.sort(candidates, function(a, b) return a.dist < b.dist end)
+    if settings.OnlyNearest and not settings.Learn then
+        candidates = { candidates[1] }
+    end
+
+    for _, c in ipairs(candidates) do
+        local animator = getAnimator(c.player.Character)
+        if animator then
+            for _, t in ipairs(animator:GetPlayingAnimationTracks()) do
+                if not t.Looped and not IGNORED_PRIORITY[t.Priority] then
+                    local pos = t.TimePosition
+                    local last = lastPos[t]
+                    local fresh = (last == nil and pos < 0.25) or (last ~= nil and pos < last - 0.05)
+                    lastPos[t] = pos
+                    if fresh then
+                        onAnimationStarted(c.player, c.hrp, myRoot, t)
+                    end
+                end
+            end
+        end
+    end
+end))
+
+-- ===== Phím tắt + dọn dẹp =====
+track(UserInputService.InputBegan:Connect(function(input, gp)
+    if not gp and input.KeyCode == TOGGLE_KEY then
+        local newState = not settings.Enabled
+        setEnabled(newState)
+    end
+end))
+
+local function cleanup()
+    settings.Enabled = false
+    settings.Learn = false
+    for _, c in ipairs(connections) do
+        pcall(function() c:Disconnect() end)
+    end
+    table.clear(connections)
+    if blocking then pressBlock(false) end
+    Gui:Destroy()
+    env.JJS_AutoBlockCleanup = nil
+end
+env.JJS_AutoBlockCleanup = cleanup
+CloseBtn.MouseButton1Click:Connect(cleanup)
